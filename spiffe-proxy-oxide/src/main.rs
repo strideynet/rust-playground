@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Starting!");
 
     let mut client = spiffe::WorkloadApiClient::default().await?;
-    let ctx = Arc::new(client.fetch_x509_context().await?);
+    let ctx = client.fetch_x509_context().await?;
     let svid = ctx.default_svid().ok_or("no default SVID")?;
 
     // Convert SPIFFE SVID to rustls expected DER vec of certificates
