@@ -1,9 +1,9 @@
+use rustls::pki_types::{CertificateDer, Der, PrivateKeyDer};
+use rustls::sign::{CertifiedKey, SingleCertAndKey};
 use std::io::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use rustls::pki_types::{CertificateDer, Der, PrivateKeyDer};
-use rustls::sign::{CertifiedKey, SingleCertAndKey};
-use tokio::io::{sink, AsyncWriteExt};
+use tokio::io::{AsyncWriteExt, sink};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -21,23 +21,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut client = spiffe::WorkloadApiClient::default().await?;
     let ctx = client.fetch_x509_context().await?;
-    let svid = ctx.default_svid().ok_or("no default SVID")?;
+    let svid = ctx.default_svid().ok_or("no default SVID").clone()?;
 
     // Convert SPIFFE SVID to rustls expected DER vec of certificates
-    let cert_chain = svid.cert_chain()
+    let cert_chain = svid
+        .cert_chain()
         .iter()
-        .map(|cert| CertificateDer::from_slice(cert.content()))
+        .map(|cert| CertificateDer::from(cert.content().to_vec()))
         .collect::<Vec<_>>();
 
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(
             cert_chain,
-            PrivateKeyDer::try_from(svid.private_key().content())?
+            PrivateKeyDer::try_from(svid.private_key().content().to_vec())?,
         )?;
     let config_arc = Arc::new(config);
     let acceptor = TlsAcceptor::from(config_arc);
-
 
     let listener = TcpListener::bind("127.0.0.1:3883").await?;
     let local_addr = listener.local_addr()?;
