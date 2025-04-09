@@ -71,11 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/metrics", axum::routing::get(metrics_handler));
         let http_listener = tokio::net::TcpListener::bind("127.0.0.1:3884").await?;
 
-        if let Err(e) = axum::serve(http_listener, http_router).await {
-            tracing::error!(error = %e, "Error starting HTTP server");
-        } else {
-            tracing::info!("HTTP server started");
-        }
+        axum::serve(http_listener, http_router).await?;
         Ok(())
     });
 
