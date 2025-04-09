@@ -1,5 +1,6 @@
 use rustls::pki_types::{CertificateDer, Der, PrivateKeyDer};
-use rustls::sign::{CertifiedKey, SingleCertAndKey};
+use rustls::server::WebPkiClientVerifier;
+use x509_parser::prelude::*;
 use std::io::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut client = spiffe::WorkloadApiClient::default().await?;
     let ctx = client.fetch_x509_context().await?;
-    let svid = ctx.default_svid().ok_or("no default SVID").clone()?;
+    let svid = ctx.default_svid().ok_or("no default SVID")?;
 
     // Convert SPIFFE SVID to rustls expected DER vec of certificates
     let cert_chain = svid
@@ -30,8 +31,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|cert| CertificateDer::from(cert.content().to_vec()))
         .collect::<Vec<_>>();
 
+    let mut root_store = rustls::RootCertStore::empty();
+    let trust_bundle= ctx.bundle_set()
+        .get_bundle(svid.spiffe_id().trust_domain())
+        .ok_or("no bundle for trust domain")?
+        .authorities();
+    for authority in trust_bundle {
+        root_store.add(authority.content().into())?;
+    }
+    let client_verifier = WebPkiClientVerifier::builder(Arc::new(root_store)).build()?;
+
     let config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
+        .with_client_cert_verifier(client_verifier)
         .with_single_cert(
             cert_chain,
             PrivateKeyDer::try_from(svid.private_key().content().to_vec())?,
@@ -55,14 +66,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+fn extract_uri_san(
+    parsed_cert: &X509Certificate
+) -> Result<String, Box<dyn std::error::Error>> {
+    let sans = parsed_cert
+    .subject_alternative_name()?
+    .ok_or("No SANs")?;
+
+    for san in sans.value.general_names.iter() {
+        if let x509_parser::extensions::GeneralName::URI(uri) = san {
+            return Ok(uri.to_string());
+        }
+    }
+    Err("No URI SAN".into())
+}
+
 async fn handle_connection(
     acceptor: TlsAcceptor,
     stream: TcpStream,
     peer_addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut stream = acceptor.accept(stream).await.unwrap();
-    let mut output = sink();
-    stream.write_all(b"Hello, world!").await.unwrap();
-    stream.shutdown().await.unwrap();
+    let mut stream = acceptor.accept(stream).await?;
+    
+    let (_, conn_info) = stream.get_ref();
+    let peer_certs = conn_info.peer_certificates().ok_or("No peer certificates")?;
+    let leaf_cert = peer_certs.first().ok_or("No leaf certificate")?;
+
+    let (_, parsed_leaf) = x509_parser::prelude::X509Certificate::from_der(leaf_cert)?;
+    let uri_san = extract_uri_san(&parsed_leaf)?;
+
+    let message = format!(
+        "Hello, world! Peer certificate: {} - your SPIFFE ID is {}",
+        parsed_leaf.subject,
+        uri_san
+    );
+    stream.write_all(message.as_bytes()).await?;
+    stream.shutdown().await?;
     Ok(())
 }

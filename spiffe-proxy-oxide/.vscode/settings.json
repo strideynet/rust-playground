@@ -1,0 +1,5 @@
+{
+    "rust-analyzer.runnables.extraEnv": {
+        "SPIFFE_ENDPOINT_SOCKET": "unix:///Users/noah/code/gravitational/teleport-scratch/tbot/workload-identity/workload.sock",
+    }
+}
