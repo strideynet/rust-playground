@@ -2,18 +2,20 @@ use axum::http::StatusCode;
 use axum::Router;
 use rustls::pki_types::{CertificateDer, Der, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
+use tokio::net::unix::SocketAddr;
 use tokio::task;
 use x509_parser::prelude::*;
-use std::io::Error;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, sink};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tracing_subscriber::fmt::format::FmtSpan;
+use color_eyre::eyre::{eyre, Context, Error, Report, Result};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> Result<()> {
+    color_eyre::install()?;
+
     // construct a subscriber that prints formatted traces to stdout
     let subscriber = tracing_subscriber::fmt()
         .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
@@ -23,9 +25,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     tracing::info!("Starting!");
 
-    let mut client = spiffe::WorkloadApiClient::default().await?;
+    let mut client = spiffe::WorkloadApiClient::default().await.wrap_err("Opening SPIFFE Workload API")?;
     let ctx = client.fetch_x509_context().await?;
-    let svid = ctx.default_svid().ok_or("no default SVID")?;
+    let svid = ctx.default_svid().ok_or(Report::msg("no default SVID"))?;
 
     // Convert SPIFFE SVID to rustls expected DER vec of certificates
     let cert_chain = svid
@@ -37,18 +39,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut root_store = rustls::RootCertStore::empty();
     let trust_bundle= ctx.bundle_set()
         .get_bundle(svid.spiffe_id().trust_domain())
-        .ok_or("no bundle for trust domain")?
+        .ok_or(Report::msg("no bundle for trust domain"))?
         .authorities();
     for authority in trust_bundle {
         root_store.add(authority.content().into())?;
     }
     let client_verifier = WebPkiClientVerifier::builder(Arc::new(root_store)).build()?;
 
+    let private_key = PrivateKeyDer::try_from(svid.private_key().content().to_vec()).map_err(Report::msg)?;
     let config = rustls::ServerConfig::builder()
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(
             cert_chain,
-            PrivateKeyDer::try_from(svid.private_key().content().to_vec())?,
+            private_key,
         )?;
     let config_arc = Arc::new(config);
     let acceptor = TlsAcceptor::from(config_arc);
@@ -66,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 
     
-    let http_task: task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>> = tokio::spawn(async {
+    let http_task: task::JoinHandle<Result<()>> = tokio::spawn(async {
         let http_router = Router::new()
         .route("/metrics", axum::routing::get(metrics_handler));
         let http_listener = tokio::net::TcpListener::bind("127.0.0.1:3884").await?;
@@ -75,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     });
 
-    let proxy_task: task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>> = tokio::spawn(async move {
+    let proxy_task: task::JoinHandle<Result<()>> = tokio::spawn(async move {
         loop {
             let (stream, peer_addr) = listener.accept().await?;
             connection_counter.inc();
@@ -112,29 +115,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 fn extract_uri_san(
     parsed_cert: &X509Certificate
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<String> {
     let sans = parsed_cert
     .subject_alternative_name()?
-    .ok_or("No SANs")?;
+    .ok_or(eyre!("No SAN"))?;
 
     for san in sans.value.general_names.iter() {
         if let x509_parser::extensions::GeneralName::URI(uri) = san {
             return Ok(uri.to_string());
         }
     }
-    Err("No URI SAN".into())
+    Err(eyre!("No URI SAN found"))
 }
 
 async fn handle_connection(
     acceptor: TlsAcceptor,
     stream: TcpStream,
-    peer_addr: SocketAddr,
-) -> Result<(), Box<dyn std::error::Error>> {
+    peer_addr: std::net::SocketAddr,
+) -> Result<()> {
     let mut stream = acceptor.accept(stream).await?;
     
     let (_, conn_info) = stream.get_ref();
-    let peer_certs = conn_info.peer_certificates().ok_or("No peer certificates")?;
-    let leaf_cert = peer_certs.first().ok_or("No leaf certificate")?;
+    let peer_certs = conn_info.peer_certificates().ok_or(eyre!("No peer certificates"))?;
+    let leaf_cert = peer_certs.first().ok_or(eyre!("No leaf certificate"))?;
 
     let (_, parsed_leaf) = x509_parser::prelude::X509Certificate::from_der(leaf_cert)?;
     let uri_san = extract_uri_san(&parsed_leaf)?;
