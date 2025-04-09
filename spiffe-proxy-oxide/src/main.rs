@@ -1,5 +1,8 @@
+use axum::http::StatusCode;
+use axum::Router;
 use rustls::pki_types::{CertificateDer, Der, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
+use tokio::task;
 use x509_parser::prelude::*;
 use std::io::Error;
 use std::net::SocketAddr;
@@ -10,7 +13,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing_subscriber::fmt::format::FmtSpan;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // construct a subscriber that prints formatted traces to stdout
     let subscriber = tracing_subscriber::fmt()
         .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
@@ -50,20 +53,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_arc = Arc::new(config);
     let acceptor = TlsAcceptor::from(config_arc);
 
+    let connection_counter = prometheus::Counter::with_opts(
+        prometheus::Opts::new(
+            "connections_accepted", 
+            "Number of connections accepted",
+        ))?;
+    prometheus::register(Box::new(connection_counter.clone()))?;
+
     let listener = TcpListener::bind("127.0.0.1:3883").await?;
     let local_addr = listener.local_addr()?;
     tracing::info!(addr = local_addr.to_string(), "Listening");
 
-    loop {
-        let (stream, peer_addr) = listener.accept().await?;
-        let acceptor = acceptor.clone();
-        tracing::info!(peer_addr = peer_addr.to_string(), "New connection!");
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(acceptor, stream, peer_addr).await {
-                tracing::error!(error = %e, "Error handling connection");
+
+    
+    let http_task: task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>> = tokio::spawn(async {
+        let http_router = Router::new()
+        .route("/metrics", axum::routing::get(metrics_handler));
+        let http_listener = tokio::net::TcpListener::bind("127.0.0.1:3884").await?;
+
+        if let Err(e) = axum::serve(http_listener, http_router).await {
+            tracing::error!(error = %e, "Error starting HTTP server");
+        } else {
+            tracing::info!("HTTP server started");
+        }
+        Ok(())
+    });
+
+    let proxy_task: task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>> = tokio::spawn(async move {
+        loop {
+            let (stream, peer_addr) = listener.accept().await?;
+            connection_counter.inc();
+            let acceptor = acceptor.clone();
+            tracing::info!(peer_addr = peer_addr.to_string(), "New connection!");
+            tokio::spawn(async move {
+                if let Err(e) = handle_connection(acceptor, stream, peer_addr).await {
+                    tracing::error!(error = %e, "Error handling connection");
+                }
+            });
+        }
+    });
+
+    // Wait for either task to exit
+    tokio::select! {
+        result = http_task => {
+            match result {
+                Err(e) => tracing::error!(error = %e, "HTTP task panicked"),
+                Ok(Ok(_)) => tracing::info!("HTTP task exited without error"),
+                Ok(Err(e)) => tracing::error!(error = %e, "HTTP task exited with error"),
             }
-        });
-    }
+        }
+        result = proxy_task => {
+            match result {
+                Err(e) => tracing::error!(error = %e, "Proxy task panicked"),
+                Ok(Ok(_)) => tracing::info!("Proxy task exited without error"),
+                Ok(Err(e)) => tracing::error!(error = %e, "Proxy task exited with error"),
+            }
+        }
+    };
+
+    Ok(())
 }
 
 fn extract_uri_san(
@@ -103,4 +151,12 @@ async fn handle_connection(
     stream.write_all(message.as_bytes()).await?;
     stream.shutdown().await?;
     Ok(())
+}
+
+async fn metrics_handler() -> Result<String, StatusCode> {
+    let encoder = prometheus::TextEncoder::new();
+    let encoded = encoder.
+        encode_to_string(&prometheus::gather())
+        .or(Err(StatusCode::INTERNAL_SERVER_ERROR))?;
+    Ok(encoded)
 }
