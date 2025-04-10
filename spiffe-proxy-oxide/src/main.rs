@@ -1,16 +1,16 @@
 use axum::http::StatusCode;
 use axum::Router;
-use rustls::pki_types::{CertificateDer, Der, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
-use tokio::net::unix::SocketAddr;
 use tokio::task;
+use tokio_rustls::server::TlsStream;
 use x509_parser::prelude::*;
 use std::sync::Arc;
-use tokio::io::{AsyncWriteExt, sink};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tracing_subscriber::fmt::format::FmtSpan;
-use color_eyre::eyre::{eyre, Context, Error, Report, Result};
+use color_eyre::eyre::{eyre, Context, Report, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -67,8 +67,6 @@ async fn main() -> Result<()> {
     let local_addr = listener.local_addr()?;
     tracing::info!(addr = local_addr.to_string(), "Listening");
 
-
-    
     let http_task: task::JoinHandle<Result<()>> = tokio::spawn(async {
         let http_router = Router::new()
         .route("/metrics", axum::routing::get(metrics_handler));
@@ -128,6 +126,18 @@ fn extract_uri_san(
     Err(eyre!("No URI SAN found"))
 }
 
+fn authenticate_client(
+    tls_stream: &TlsStream<TcpStream>
+) -> Result<String> {
+    let (_, conn_info) = tls_stream.get_ref();
+    let peer_certs = conn_info.peer_certificates().ok_or(eyre!("No peer certificates"))?;
+    let leaf_cert = peer_certs.first().ok_or(eyre!("No leaf certificate"))?;
+
+    let (_, parsed_leaf) = x509_parser::prelude::X509Certificate::from_der(leaf_cert)?;
+    let uri_san = extract_uri_san(&parsed_leaf)?;
+    Ok(uri_san)
+}
+
 async fn handle_connection(
     acceptor: TlsAcceptor,
     stream: TcpStream,
@@ -135,17 +145,12 @@ async fn handle_connection(
 ) -> Result<()> {
     let mut stream = acceptor.accept(stream).await?;
     
-    let (_, conn_info) = stream.get_ref();
-    let peer_certs = conn_info.peer_certificates().ok_or(eyre!("No peer certificates"))?;
-    let leaf_cert = peer_certs.first().ok_or(eyre!("No leaf certificate"))?;
-
-    let (_, parsed_leaf) = x509_parser::prelude::X509Certificate::from_der(leaf_cert)?;
-    let uri_san = extract_uri_san(&parsed_leaf)?;
+    let uri_san = authenticate_client(&stream)?;
 
     let message = format!(
-        "Hello, world! Peer certificate: {} - your SPIFFE ID is {}",
-        parsed_leaf.subject,
-        uri_san
+        "Hello, world! Your SPIFFE ID is {} and your addr is {}",
+        uri_san,
+        peer_addr,
     );
     stream.write_all(message.as_bytes()).await?;
     stream.shutdown().await?;
