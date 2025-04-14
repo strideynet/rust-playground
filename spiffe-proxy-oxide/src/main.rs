@@ -1,14 +1,16 @@
 use axum::http::StatusCode;
 use axum::Router;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, IpAddr, PrivateKeyDer, ServerName};
 use rustls::server::WebPkiClientVerifier;
+use rustls::{ClientConfig, RootCertStore};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task;
 use tokio_rustls::server::TlsStream;
 use x509_parser::prelude::*;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing_subscriber::fmt::format::FmtSpan;
 use color_eyre::eyre::{eyre, Context, Report, Result};
 
@@ -60,32 +62,52 @@ async fn main() -> Result<()> {
         prometheus::Opts::new(
             "connections_accepted", 
             "Number of connections accepted",
-        ))?;
+        )
+    )?;
     prometheus::register(Box::new(connection_counter.clone()))?;
-
-    let listener = TcpListener::bind("127.0.0.1:3883").await?;
-    let local_addr = listener.local_addr()?;
-    tracing::info!(addr = local_addr.to_string(), "Listening");
+    let connection_gauge = prometheus::Gauge::with_opts(
+        prometheus::Opts::new(
+            "connections_active", 
+            "Number of active connections",
+        )
+    )?;
+    prometheus::register(Box::new(connection_gauge.clone()))?;
 
     let http_task: task::JoinHandle<Result<()>> = tokio::spawn(async {
-        let http_router = Router::new()
+        let router = Router::new()
         .route("/metrics", axum::routing::get(metrics_handler));
-        let http_listener = tokio::net::TcpListener::bind("127.0.0.1:3884").await?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:3884").await?;
+        tracing::info!(
+            addr = listener.local_addr()?.to_string(), 
+            "Listening HTTP TLS connections",
+        );
 
-        axum::serve(http_listener, http_router).await?;
+        axum::serve(listener, router).await?;
         Ok(())
     });
 
     let proxy_task: task::JoinHandle<Result<()>> = tokio::spawn(async move {
+        let listener = TcpListener::bind("127.0.0.1:3883").await?;
+        let local_addr = listener.local_addr()?;
+        tracing::info!(
+            addr = local_addr.to_string(),
+            "Listening for TLS connections"
+        );
+
         loop {
             let (stream, peer_addr) = listener.accept().await?;
-            connection_counter.inc();
+            connection_counter.inc();            
+
+            let connection_gauge = connection_gauge.clone();
             let acceptor = acceptor.clone();
+
             tracing::info!(peer_addr = peer_addr.to_string(), "New connection!");
             tokio::spawn(async move {
+                connection_gauge.inc();
                 if let Err(e) = handle_connection(acceptor, stream, peer_addr).await {
                     tracing::error!(error = %e, "Error handling connection");
                 }
+                connection_gauge.dec();
             });
         }
     });
@@ -111,6 +133,15 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn metrics_handler() -> Result<String, StatusCode> {
+    let encoder = prometheus::TextEncoder::new();
+    let encoded = encoder.
+        encode_to_string(&prometheus::gather())
+        .or(Err(StatusCode::INTERNAL_SERVER_ERROR))?;
+    Ok(encoded)
+}
+
+#[tracing::instrument(skip(parsed_cert))]
 fn extract_uri_san(
     parsed_cert: &X509Certificate
 ) -> Result<String> {
@@ -126,6 +157,7 @@ fn extract_uri_san(
     Err(eyre!("No URI SAN found"))
 }
 
+#[tracing::instrument]
 fn authenticate_client(
     tls_stream: &TlsStream<TcpStream>
 ) -> Result<String> {
@@ -140,27 +172,77 @@ fn authenticate_client(
 
 async fn handle_connection(
     acceptor: TlsAcceptor,
-    stream: TcpStream,
+    downstream: TcpStream,
     peer_addr: std::net::SocketAddr,
 ) -> Result<()> {
-    let mut stream = acceptor.accept(stream).await?;
+    let mut downstream = acceptor.accept(downstream).await?;
     
-    let uri_san = authenticate_client(&stream)?;
+    let uri_san = authenticate_client(&downstream)?;
+    tracing::info!(peer_addr = peer_addr.to_string(), uri_san = uri_san, "Client authenticated");
 
-    let message = format!(
-        "Hello, world! Your SPIFFE ID is {} and your addr is {}",
-        uri_san,
-        peer_addr,
-    );
-    stream.write_all(message.as_bytes()).await?;
-    stream.shutdown().await?;
+    //let upstream_connector: &dyn UpstreamConnector = &TCPUpstreamConnector{
+     //   addr: "localhost:3884".to_string(),
+    //};
+    let upstream_connector: &dyn UpstreamConnector = &TLSUpstreamConnector{
+        addr: "google.com:443".to_string(),
+    };
+    let mut upstream = upstream_connector.connect().await?;
+
+    tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await?;
     Ok(())
 }
 
-async fn metrics_handler() -> Result<String, StatusCode> {
-    let encoder = prometheus::TextEncoder::new();
-    let encoded = encoder.
-        encode_to_string(&prometheus::gather())
-        .or(Err(StatusCode::INTERNAL_SERVER_ERROR))?;
-    Ok(encoded)
+trait AsyncStream: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncStream for T {}
+
+/// A trait for connecting to an upstream service.
+#[async_trait::async_trait]
+trait UpstreamConnector {
+    async fn connect(&self) -> Result<Box<dyn AsyncStream>>;
+}
+
+/// An upstream connector that connects using plain TCP to a given address.
+struct TCPUpstreamConnector {
+    addr: String,
+}
+
+#[async_trait::async_trait]
+impl UpstreamConnector for TCPUpstreamConnector {
+    async fn connect(&self) -> Result<Box<dyn AsyncStream>> {
+        let stream = TcpStream::connect(self.addr.clone()).await?;
+        Ok(Box::new(stream))
+    }
+}
+
+
+struct TLSUpstreamConnector {
+    addr: String,
+}
+
+#[async_trait::async_trait]
+impl UpstreamConnector for TLSUpstreamConnector {
+    async fn connect(&self) -> Result<Box<dyn AsyncStream>> {
+        let mut root_cert_store: RootCertStore = RootCertStore::empty();
+        root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let mut config = ClientConfig::builder()
+            .with_root_certificates(root_cert_store)
+            .with_no_client_auth();
+
+        // TODO: Make ALPN configurable.
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+        let server_name = ServerName::try_from("google.com")?;
+        
+        let connector = TlsConnector::from(Arc::new(config));
+
+        let stream = TcpStream::connect(self.addr.clone()).await?;
+        tracing::info!("Connected TCP to upstream server");
+        let stream = connector.connect(
+            server_name, 
+            stream,
+        ).await?;
+        tracing::info!("Connected TLS to upstream server");
+
+        Ok(Box::new(stream))
+    }
 }
