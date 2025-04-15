@@ -180,13 +180,15 @@ async fn handle_connection(
     let uri_san = authenticate_client(&downstream)?;
     tracing::info!(peer_addr = peer_addr.to_string(), uri_san = uri_san, "Client authenticated");
 
+    let downsteam_ctx = DownstreamContext {};
     //let upstream_connector: &dyn UpstreamConnector = &TCPUpstreamConnector{
      //   addr: "localhost:3884".to_string(),
     //};
     let upstream_connector: &dyn UpstreamConnector = &TLSUpstreamConnector{
         addr: "google.com:443".to_string(),
+        alpn_behaviour: ALPNBehaviour::UseALPN(vec![b"http/1.1".to_vec()]),
     };
-    let mut upstream = upstream_connector.connect().await?;
+    let mut upstream = upstream_connector.connect(downsteam_ctx).await?;
 
     tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await?;
     Ok(())
@@ -195,10 +197,11 @@ async fn handle_connection(
 trait AsyncStream: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncStream for T {}
 
+struct DownstreamContext {}
 /// A trait for connecting to an upstream service.
 #[async_trait::async_trait]
 trait UpstreamConnector {
-    async fn connect(&self) -> Result<Box<dyn AsyncStream>>;
+    async fn connect(&self, ctx: DownstreamContext) -> Result<Box<dyn AsyncStream>>;
 }
 
 /// An upstream connector that connects using plain TCP to a given address.
@@ -208,28 +211,40 @@ struct TCPUpstreamConnector {
 
 #[async_trait::async_trait]
 impl UpstreamConnector for TCPUpstreamConnector {
-    async fn connect(&self) -> Result<Box<dyn AsyncStream>> {
+    async fn connect(&self, _ctx: DownstreamContext) -> Result<Box<dyn AsyncStream>> {
         let stream = TcpStream::connect(self.addr.clone()).await?;
         Ok(Box::new(stream))
     }
 }
 
+enum ALPNBehaviour {
+    ForwardALPN(),
+    UseALPN(Vec<Vec<u8>>)
+}
+
 
 struct TLSUpstreamConnector {
     addr: String,
+    alpn_behaviour: ALPNBehaviour,
 }
 
 #[async_trait::async_trait]
 impl UpstreamConnector for TLSUpstreamConnector {
-    async fn connect(&self) -> Result<Box<dyn AsyncStream>> {
+    async fn connect(&self, _ctx: DownstreamContext) -> Result<Box<dyn AsyncStream>> {
         let mut root_cert_store: RootCertStore = RootCertStore::empty();
         root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let mut config = ClientConfig::builder()
             .with_root_certificates(root_cert_store)
             .with_no_client_auth();
 
-        // TODO: Make ALPN configurable.
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        match self.alpn_behaviour {
+            ALPNBehaviour::ForwardALPN() => {
+                config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            }
+            ALPNBehaviour::UseALPN(ref alpn) => {
+                config.alpn_protocols = alpn.clone();
+            }
+        }
 
         let server_name = ServerName::try_from("google.com")?;
         
@@ -244,5 +259,23 @@ impl UpstreamConnector for TLSUpstreamConnector {
         tracing::info!("Connected TLS to upstream server");
 
         Ok(Box::new(stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Note this useful idiom: importing names from outer (for mod tests) scope.
+    use super::*;
+
+    #[test]
+    fn test_extract_uri_san() {
+        let file = std::io::BufReader::new(
+            std::fs::File::open("./src/testdata/spiffe_cert.pem").unwrap()
+        );
+        let (pem, _) = Pem::read(file).unwrap();
+        let cert = pem.parse_x509().unwrap();
+
+        let san = extract_uri_san(&cert).unwrap();
+        assert_eq!(san, "spiffe://leaf.tele.ottr.sh/foo/bar/my-lovely-pod/bar");
     }
 }
