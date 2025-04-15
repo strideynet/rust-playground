@@ -16,4 +16,6 @@ axum = "0.8.3"
 color-eyre = "0.6.3"
 async-trait = "0.1.88"
 webpki-roots = "0.26.8"
+figment = { version = "0.10.19", features = ["yaml", "serde_json", "serde_yaml"] }
+serde = "1.0.219"
 

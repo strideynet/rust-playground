@@ -1,5 +1,7 @@
 use axum::http::StatusCode;
 use axum::Router;
+use figment::providers::Serialized;
+use figment::Figment;
 use rustls::pki_types::{CertificateDer, IpAddr, PrivateKeyDer, ServerName};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore};
@@ -13,6 +15,50 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing_subscriber::fmt::format::FmtSpan;
 use color_eyre::eyre::{eyre, Context, Report, Result};
+use serde::{Serialize, Deserialize};
+
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+struct Config {
+    metrics_listen_addr: String,
+    listeners: Vec<ListenerConfig>,
+}
+
+impl Default for Config {
+    fn default() -> Config {
+        Config {
+            metrics_listen_addr: "127.0.0.1:3884".into(),
+            listeners: vec![],
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct ListenerConfig {
+    listen_addr: String,
+    upstream: ListenerUpstreamConfig,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[serde(tag = "type")]
+enum ListenerUpstreamConfig {
+    #[serde(rename = "tcp")]
+    TCP(TCPUpstreamConfig),
+    #[serde(rename = "tls")]
+    TLS(TLSUpstreamConfig)
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct TCPUpstreamConfig {
+    addr: String,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct TLSUpstreamConfig {
+    addr: String,
+}
+
+
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -26,6 +72,10 @@ async fn main() -> Result<()> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     tracing::info!("Starting!");
+
+    let cfg: Config = Figment::from(
+        Serialized::defaults(Config::default())
+    ).extract()?;
 
     let mut client = spiffe::WorkloadApiClient::default().await.wrap_err("Opening SPIFFE Workload API")?;
     let ctx = client.fetch_x509_context().await?;
@@ -76,7 +126,7 @@ async fn main() -> Result<()> {
     let http_task: task::JoinHandle<Result<()>> = tokio::spawn(async {
         let router = Router::new()
         .route("/metrics", axum::routing::get(metrics_handler));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:3884").await?;
+        let listener = tokio::net::TcpListener::bind(cfg.metrics_listen_addr).await?;
         tracing::info!(
             addr = listener.local_addr()?.to_string(), 
             "Listening HTTP TLS connections",
@@ -264,6 +314,8 @@ impl UpstreamConnector for TLSUpstreamConnector {
 
 #[cfg(test)]
 mod tests {
+    use figment::providers::Format;
+
     // Note this useful idiom: importing names from outer (for mod tests) scope.
     use super::*;
 
@@ -277,5 +329,29 @@ mod tests {
 
         let san = extract_uri_san(&cert).unwrap();
         assert_eq!(san, "spiffe://leaf.tele.ottr.sh/foo/bar/my-lovely-pod/bar");
+    }
+
+    #[test]
+    fn test_config_load() {
+        let cfg: Config = Figment::from(
+            Serialized::defaults(Config::default())
+        ).merge(figment::providers::Yaml::file("./src/testdata/config.yaml"))
+        .extract().unwrap();
+        assert_eq!(
+            cfg,
+            Config{
+                metrics_listen_addr: "0.0.0.0:1337".into(),
+                listeners: vec![
+                    ListenerConfig{
+                        listen_addr: "0.0.0.0:1338".into(),
+                        upstream: ListenerUpstreamConfig::TCP(
+                            TCPUpstreamConfig {
+                                addr: "127.0.0.1:8080".into(),
+                            }
+                        )
+                    }
+                ]
+            }
+        )
     }
 }

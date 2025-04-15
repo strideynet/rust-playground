@@ -1,0 +1,6 @@
+metrics_listen_addr: 0.0.0.0:1337
+listeners:
+- listen_addr: 0.0.0.0:1338
+  upstream:
+    type: tcp
+    addr: 127.0.0.1:8080
