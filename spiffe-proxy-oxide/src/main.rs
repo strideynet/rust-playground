@@ -1,17 +1,17 @@
-use axum::http::StatusCode;
 use axum::Router;
+use axum::http::StatusCode;
+use color_eyre::eyre::{Context, Report, Result, eyre};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore};
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::task;
 use tokio_rustls::server::TlsStream;
-use x509_parser::prelude::*;
-use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing_subscriber::fmt::format::FmtSpan;
-use color_eyre::eyre::{eyre, Context, Report, Result};
+use x509_parser::prelude::*;
 
 mod config;
 
@@ -29,7 +29,9 @@ async fn main() -> Result<()> {
     tracing::info!("Starting!");
     let cfg = config::Config::load()?;
 
-    let mut client = spiffe::WorkloadApiClient::default().await.wrap_err("Opening SPIFFE Workload API")?;
+    let mut client = spiffe::WorkloadApiClient::default()
+        .await
+        .wrap_err("Opening SPIFFE Workload API")?;
     let ctx = client.fetch_x509_context().await?;
     let svid = ctx.default_svid().ok_or(Report::msg("no default SVID"))?;
 
@@ -41,7 +43,8 @@ async fn main() -> Result<()> {
         .collect::<Vec<_>>();
 
     let mut root_store = rustls::RootCertStore::empty();
-    let trust_bundle= ctx.bundle_set()
+    let trust_bundle = ctx
+        .bundle_set()
         .get_bundle(svid.spiffe_id().trust_domain())
         .ok_or(Report::msg("no bundle for trust domain"))?
         .authorities();
@@ -50,37 +53,30 @@ async fn main() -> Result<()> {
     }
     let client_verifier = WebPkiClientVerifier::builder(Arc::new(root_store)).build()?;
 
-    let private_key = PrivateKeyDer::try_from(svid.private_key().content().to_vec()).map_err(Report::msg)?;
+    let private_key =
+        PrivateKeyDer::try_from(svid.private_key().content().to_vec()).map_err(Report::msg)?;
     let config = rustls::ServerConfig::builder()
         .with_client_cert_verifier(client_verifier)
-        .with_single_cert(
-            cert_chain,
-            private_key,
-        )?;
+        .with_single_cert(cert_chain, private_key)?;
     let config_arc = Arc::new(config);
     let acceptor = TlsAcceptor::from(config_arc);
 
-    let connection_counter = prometheus::Counter::with_opts(
-        prometheus::Opts::new(
-            "connections_accepted", 
-            "Number of connections accepted",
-        )
-    )?;
+    let connection_counter = prometheus::Counter::with_opts(prometheus::Opts::new(
+        "connections_accepted",
+        "Number of connections accepted",
+    ))?;
     prometheus::register(Box::new(connection_counter.clone()))?;
-    let connection_gauge = prometheus::Gauge::with_opts(
-        prometheus::Opts::new(
-            "connections_active", 
-            "Number of active connections",
-        )
-    )?;
+    let connection_gauge = prometheus::Gauge::with_opts(prometheus::Opts::new(
+        "connections_active",
+        "Number of active connections",
+    ))?;
     prometheus::register(Box::new(connection_gauge.clone()))?;
 
     let http_task: task::JoinHandle<Result<()>> = tokio::spawn(async {
-        let router = Router::new()
-        .route("/metrics", axum::routing::get(metrics_handler));
+        let router = Router::new().route("/metrics", axum::routing::get(metrics_handler));
         let listener = tokio::net::TcpListener::bind(cfg.metrics_listen_addr).await?;
         tracing::info!(
-            addr = listener.local_addr()?.to_string(), 
+            addr = listener.local_addr()?.to_string(),
             "Listening HTTP TLS connections",
         );
 
@@ -98,7 +94,7 @@ async fn main() -> Result<()> {
 
         loop {
             let (stream, peer_addr) = listener.accept().await?;
-            connection_counter.inc();            
+            connection_counter.inc();
 
             let connection_gauge = connection_gauge.clone();
             let acceptor = acceptor.clone();
@@ -137,19 +133,17 @@ async fn main() -> Result<()> {
 
 async fn metrics_handler() -> Result<String, StatusCode> {
     let encoder = prometheus::TextEncoder::new();
-    let encoded = encoder.
-        encode_to_string(&prometheus::gather())
+    let encoded = encoder
+        .encode_to_string(&prometheus::gather())
         .or(Err(StatusCode::INTERNAL_SERVER_ERROR))?;
     Ok(encoded)
 }
 
 #[tracing::instrument(skip(parsed_cert))]
-fn extract_uri_san(
-    parsed_cert: &X509Certificate
-) -> Result<String> {
+fn extract_uri_san(parsed_cert: &X509Certificate) -> Result<String> {
     let sans = parsed_cert
-    .subject_alternative_name()?
-    .ok_or(eyre!("No SAN"))?;
+        .subject_alternative_name()?
+        .ok_or(eyre!("No SAN"))?;
 
     for san in sans.value.general_names.iter() {
         if let x509_parser::extensions::GeneralName::URI(uri) = san {
@@ -160,11 +154,11 @@ fn extract_uri_san(
 }
 
 #[tracing::instrument]
-fn authenticate_client(
-    tls_stream: &TlsStream<TcpStream>
-) -> Result<String> {
+fn authenticate_client(tls_stream: &TlsStream<TcpStream>) -> Result<String> {
     let (_, conn_info) = tls_stream.get_ref();
-    let peer_certs = conn_info.peer_certificates().ok_or(eyre!("No peer certificates"))?;
+    let peer_certs = conn_info
+        .peer_certificates()
+        .ok_or(eyre!("No peer certificates"))?;
     let leaf_cert = peer_certs.first().ok_or(eyre!("No leaf certificate"))?;
 
     let (_, parsed_leaf) = x509_parser::prelude::X509Certificate::from_der(leaf_cert)?;
@@ -178,15 +172,19 @@ async fn handle_connection(
     peer_addr: std::net::SocketAddr,
 ) -> Result<()> {
     let mut downstream = acceptor.accept(downstream).await?;
-    
+
     let uri_san = authenticate_client(&downstream)?;
-    tracing::info!(peer_addr = peer_addr.to_string(), uri_san = uri_san, "Client authenticated");
+    tracing::info!(
+        peer_addr = peer_addr.to_string(),
+        uri_san = uri_san,
+        "Client authenticated"
+    );
 
     let downsteam_ctx = DownstreamContext {};
     //let upstream_connector: &dyn UpstreamConnector = &TCPUpstreamConnector{
-     //   addr: "localhost:3884".to_string(),
+    //   addr: "localhost:3884".to_string(),
     //};
-    let upstream_connector: &dyn UpstreamConnector = &TLSUpstreamConnector{
+    let upstream_connector: &dyn UpstreamConnector = &TLSUpstreamConnector {
         addr: "google.com:443".to_string(),
         alpn_behaviour: ALPNBehaviour::UseALPN(vec![b"http/1.1".to_vec()]),
     };
@@ -221,9 +219,8 @@ impl UpstreamConnector for TCPUpstreamConnector {
 
 enum ALPNBehaviour {
     ForwardALPN(),
-    UseALPN(Vec<Vec<u8>>)
+    UseALPN(Vec<Vec<u8>>),
 }
-
 
 struct TLSUpstreamConnector {
     addr: String,
@@ -249,15 +246,12 @@ impl UpstreamConnector for TLSUpstreamConnector {
         }
 
         let server_name = ServerName::try_from("google.com")?;
-        
+
         let connector = TlsConnector::from(Arc::new(config));
 
         let stream = TcpStream::connect(self.addr.clone()).await?;
         tracing::info!("Connected TCP to upstream server");
-        let stream = connector.connect(
-            server_name, 
-            stream,
-        ).await?;
+        let stream = connector.connect(server_name, stream).await?;
         tracing::info!("Connected TLS to upstream server");
 
         Ok(Box::new(stream))
@@ -266,16 +260,12 @@ impl UpstreamConnector for TLSUpstreamConnector {
 
 #[cfg(test)]
 mod tests {
-    
-
-    // Note this useful idiom: importing names from outer (for mod tests) scope.
     use super::*;
 
     #[test]
     fn test_extract_uri_san() {
-        let file = std::io::BufReader::new(
-            std::fs::File::open("./src/testdata/spiffe_cert.pem").unwrap()
-        );
+        let file =
+            std::io::BufReader::new(std::fs::File::open("./src/testdata/spiffe_cert.pem").unwrap());
         let (pem, _) = Pem::read(file).unwrap();
         let cert = pem.parse_x509().unwrap();
 

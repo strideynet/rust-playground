@@ -1,5 +1,5 @@
-use serde::{Serialize, Deserialize};
 use color_eyre::eyre::Result;
+use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct Config {
@@ -8,10 +8,10 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn load() -> Result <Config> {
-        let cfg: Config = figment::Figment::from(
-            figment::providers::Serialized::defaults(Config::default())
-        ).extract()?;
+    pub fn load() -> Result<Config> {
+        let cfg: Config =
+            figment::Figment::from(figment::providers::Serialized::defaults(Config::default()))
+                .extract()?;
         Ok(cfg)
     }
 }
@@ -37,7 +37,7 @@ pub enum ListenerUpstreamConfig {
     #[serde(rename = "tcp")]
     TCP(TCPUpstreamConfig),
     #[serde(rename = "tls")]
-    TLS(TLSUpstreamConfig)
+    TLS(TLSUpstreamConfig),
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -59,24 +59,21 @@ mod tests {
 
     #[test]
     fn test_config_load() {
-        let cfg: Config = figment::Figment::from(
-            figment::providers::Serialized::defaults(Config::default())
-        ).merge(figment::providers::Yaml::file("./src/testdata/config.yaml"))
-        .extract().unwrap();
+        let cfg: Config =
+            figment::Figment::from(figment::providers::Serialized::defaults(Config::default()))
+                .merge(figment::providers::Yaml::file("./src/testdata/config.yaml"))
+                .extract()
+                .unwrap();
         assert_eq!(
             cfg,
-            Config{
+            Config {
                 metrics_listen_addr: "0.0.0.0:1337".into(),
-                listeners: vec![
-                    ListenerConfig{
-                        listen_addr: "0.0.0.0:1338".into(),
-                        upstream: ListenerUpstreamConfig::TCP(
-                            TCPUpstreamConfig {
-                                addr: "127.0.0.1:8080".into(),
-                            }
-                        )
-                    }
-                ]
+                listeners: vec![ListenerConfig {
+                    listen_addr: "0.0.0.0:1338".into(),
+                    upstream: ListenerUpstreamConfig::TCP(TCPUpstreamConfig {
+                        addr: "127.0.0.1:8080".into(),
+                    })
+                }]
             }
         )
     }
